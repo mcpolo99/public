@@ -5,12 +5,23 @@ local GLOBAL_NAME = "Path"
 local Path = {}
 
 Path.__index = Path
-Path.version = "pathlib 2.4.1(CE)"
-local eqcount = 15
+Path.version = "pathlib 2.4.2(CE)"
+local about = {
+    author ="https://github.com/mcpolo99",
+    link = "https://github.com/mcpolo99/public/tree/main/lua",
+    purpose = "used primarly for CE tables"
+}
+function Path.about()
+    print("[",Path.version,"]")
+    for k, v in pairs(about) do
+        print(("  %-8s : %s"):format(k, v))
+    end
+end
+
+local eqcount = 16
 
 -- expose globally
 _G[GLOBAL_NAME] = Path
-
 
 --------------------------------------------------
 -- helpers
