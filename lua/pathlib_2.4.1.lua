@@ -444,7 +444,6 @@ local function convert_lua_to_flat_string_multiline(file_path)
     return str2
 end
 
--- local p = Path([[G:\Cheats\Tables\Wicked-Menu-for-RDR2\Array]]) /"pathlib_2.3.4.lua"
 
 function Path.exportLua(srcFilePath, dstFilePath)
     -- normalize source
@@ -490,3 +489,4 @@ end
 print("[Pathlib] Loaded " .. Path.version)
 
 return Path
+
