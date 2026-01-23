@@ -4,7 +4,7 @@ local GLOBAL_NAME = "Path"
 
 local Path = { } -- having stuff here breaks the lua script for some reason..
 
-Path.version = "pathlib 2.4.6(CE)" 
+Path.version = "pathlib 2.4.7(CE)" 
 Path.debug=false --Set for debug help during run of path
 local about = {
     author ="https://github.com/mcpolo99",
@@ -12,7 +12,7 @@ local about = {
     purpose = "used primarly for CE tables"
 }
 
-local eqcount1 = 20
+local eqcount1 = 21
 
 -- expose globally
 _G[GLOBAL_NAME] = Path
@@ -480,6 +480,40 @@ end
 local eqcount = eqcount1
 local function convert_lua_to_flat_string_multiline(file_path,bool1)
 
+    local function scan_comment(line, in_long_comment)
+        local i = 1
+        local len = #line
+        local in_string = nil
+
+        while i <= len do
+            local c = line:sub(i, i)
+            local n = line:sub(i, i + 1)
+
+            if in_string then
+                if c == in_string then
+                    in_string = nil
+                end
+            else
+                if c == "'" or c == '"' then
+                    in_string = c
+
+                elseif not in_long_comment and n == "--" then
+                    -- long comment?
+                    local eqs = line:match("^%-%-%[(=*)%[", i)
+                    if eqs then
+                        return "long_start", i, #eqs
+                    end
+
+                    -- single-line comment
+                    return "line", i
+                end
+            end
+
+            i = i + 1
+        end
+
+        return "none"
+    end
     local function count_parens_outside_strings(line, paren_level, in_long_string)
         local i = 1
         local len = #line
@@ -591,43 +625,40 @@ local function convert_lua_to_flat_string_multiline(file_path,bool1)
     local paren_level = 0
     local in_string = nil  -- tracks if inside '..."', '...' or long string
     local in_long_comment = nil -- stores eq count or nil
+
+
     for line in content:gmatch("[^\n]+") do
         line = line:match("^%s*(.-)%s*$")
 
         if line ~= "" then
             local skip_line = false
 
-            -- long comment handling
-            if not in_long_comment then
-                local eqs = detect_long_comment_start(line)
-                if eqs then
-                    in_long_comment = eqs
-                    table.insert(lines, line)
-                    skip_line = true
-                end
-            else
+            local kind, pos, eqs = scan_comment(line, in_long_comment)
+
+            -- already inside long comment
+            if in_long_comment then
                 table.insert(lines, line)
                 if detect_long_comment_end(line, in_long_comment) then
                     in_long_comment = nil
                 end
                 skip_line = true
+
+            -- starting a long comment
+            elseif kind == "long_start" then
+                in_long_comment = eqs
+                table.insert(lines, line)
+                skip_line = true
+
+            -- normal single-line comment
+            elseif kind == "line" then
+                local code = line:sub(1, pos - 1)
+                local comment = line:sub(pos + 2)
+
+                comment = "--[==[" .. comment .. "--]==]"
+                line = code ~= "" and (code .. comment) or comment
             end
 
             if not skip_line then
-                -- normal comment handling
-                local code, comment = split_comment_outside_strings(line)
-
-                if comment then
-                    if not comment:match("^%[(=*)%[") then
-                        comment = "--[==[" .. comment .. "--]==]"
-                    else
-                        comment = "--" .. comment
-                    end
-                    line = code ~= "" and (code .. comment) or comment
-                else
-                    line = code
-                end
-
                 paren_level, in_string =
                     count_parens_outside_strings(line, paren_level, in_string)
 
@@ -641,9 +672,12 @@ local function convert_lua_to_flat_string_multiline(file_path,bool1)
                     line:match("^elseif%s+") or
                     line:match("^then$") or
                     line:match("^do$") or
-                    line:match("^repeat$"))
+                    line:match("^repeat$")
+                )
 
-                if not skip_semicolon and not line:match(";$") and not line:match(",$") then
+                if (not skip_semicolon 
+                    and not line:match(";$")
+                    and not line:match(",$")) then
                     line = line .. ";"
                 end
 
@@ -651,6 +685,7 @@ local function convert_lua_to_flat_string_multiline(file_path,bool1)
             end
         end
     end
+
 
 
     -- join lines
@@ -662,7 +697,7 @@ local function convert_lua_to_flat_string_multiline(file_path,bool1)
         print("false")
         str1 = table.concat(lines, " ")
     end
-    local version = str1:match('version%s*=%s*"([^"]+)"')
+    local version = str1:match('version%s*=%s*"([^"]+)"') or "sample1.0"
 
     local libname = version:gsub("[%. %(%) ]", "_")
 
@@ -682,6 +717,12 @@ local function convert_lua_to_flat_string_multiline(file_path,bool1)
     print(exportpath:write_file(str2))
 
     return str2
+end
+
+function Path:exportLua(other)
+    assert(self:is_file(),"path provided is not a file, check the path is correct")
+    convert_lua_to_flat_string_multiline(self(),other)
+    return 
 end
 
 --------------------------------------------------
@@ -730,3 +771,12 @@ print("[Pathlib] Loaded " .. Path.version)
 
 
 return Path
+
+--[[
+    to export this library load pathlib like it is then 
+    local p = Path([[G:\lua\pathlib.lua]])
+    p:exportLua()
+    done ! 
+--]]
+
+
