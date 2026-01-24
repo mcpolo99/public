@@ -1,18 +1,85 @@
+--------------------------------------------------------------------------------
 -- pathlib.lua (Cheat Engine Autorun)
--- Windows pathlib-like helper for Cheat Engine Lua
+--
+-- A Windows-focused pathlib-like helper for Cheat Engine Lua.
+--
+-- Features:
+--   - Object-oriented path handling
+--   - Operator overloading (/ .. () #)
+--   - File & directory queries
+--   - Read / write helpers
+--   - Glob & iteration
+--   - Lua source exporter (flattened loader)
+--
+-- Usage:
+--   local p = Path("C:\\Temp") / "file.txt"
+--   p:write_text("hello")
+-- Path.debug=true
+-- local p = Path([[S:\02Development\01Source\lua\pathlib.lua]])
+-- print(tostring(p:exportLua()))
+--
+-- Author: https://github.com/mcpolo99
+-- Repo:   https://github.com/mcpolo99/public/tree/main/lua
+--------------------------------------------------------------------------------
+
+---@class Path
+---@field path string Full normalized path string
+---@field version string Library version
+---@field debug boolean Enable debug logging
+---@field _is_dir boolean|nil Cached directory check
+---@operator div(Path|string):Path  # Path / "segment"
+---@operator concat(Path|string):Path  # Path .. "segment"
+---@operator len:integer  # #Path returns length of path string
+---@operator call:Path|string  # Path() returns string, Path("segment") joins
+---@operator eq:boolean  # Path == Path
+---@operator lt:boolean  # Path < Path
+---@operator le:boolean  # Path <= Path
+---@overload fun(...:string):Path
+---@see Path.new
+---@see Path.write_text
+---@see Path.read_file
+---@see Path.glob
+---@see Path.iterdir
+---@see Path:info
+---@see Path:exportLua
+--[[
+Pathlib for Cheat Engine Lua (Windows)
+Object-oriented path manipulation, file/directory queries, read/write helpers, globbing, and more.
+
+Example:
+    local p = Path("C:\\Temp") / "file.txt"
+    p:write_text("hello")
+    print(p:read_file())
+    for _, f in ipairs(p:parent():glob("*.txt")) do
+        print(f)
+    end
+]]
 local GLOBAL_NAME = "Path"
 
-local Path = { } -- having stuff here breaks the lua script for some reason..
+--- Global Path constructor
+--- Usage:
+---   Path("C:\\Temp")
+---   Path("C:\\", "Temp", "file.txt")
+---@overload fun(...:string):Path
+local Path = { }
 
-Path.version = "pathlib 2.4.7(CE)" 
-Path.debug=false --Set for debug help during run of path
+--- Library version string
+---@type string
+Path.version = "pathlib 2.4.11(CE)"
+
+--- Enable debug logging
+---@type boolean
+Path.debug = false
+
+--- Print library metadata and version info
+---@type table<string, string>
 local about = {
     author ="https://github.com/mcpolo99",
     link = "https://github.com/mcpolo99/public/tree/main/lua",
     purpose = "used primarly for CE tables"
 }
 
-local eqcount1 = 21
+local eqcount1 = 23
 
 -- expose globally
 _G[GLOBAL_NAME] = Path
@@ -24,8 +91,11 @@ pcall (function()
   if debmeta then getmetatable = debmeta end
 end)
 
----- Have this at the top so all functions know what to call 
-local function log( ...)
+-- internal logging with stack depth
+local log_depth = 0
+--- Print debug output if Path.debug is enabled
+---@vararg any
+local function log( ... )
     if Path.debug == false then return end
     local args = {...}
     for i = 1, #args do
@@ -39,6 +109,16 @@ local function log( ...)
     print(string.format("[%s] %s","LOG", msg))
 end
 
+-- global/local error handler
+local function log_exceptions(err_msg)
+    log("local: log_exceptions")
+    -- forward/log anywhere you want
+    error("[Path exception] " .. err_msg)
+    -- optionally return the message to propagate
+    return err_msg
+end
+
+--- Print library metadata and version info
 function Path.about()
     log("local: about")
     print("[",Path.version,"]")
@@ -47,11 +127,12 @@ function Path.about()
     end
 end
 
-
 --------------------------------------------------
 -- helpers
 --------------------------------------------------
 -- Helper: auto-convert string to Path
+---@param p Path|string
+---@return Path
 local function assertself(p)
     log("local: assertself")
     if getmetatable(p) == Path then
@@ -62,164 +143,254 @@ local function assertself(p)
         error("Expected Path or string, got " .. type(p))
     end
 end
--- Wrapper to auto-assert self
+
+---@param fn fun(self:Path, ...):any
+---@return fun(self:Path|any, ...):any
 local function wrap_method(fn)
     log("wrap_method")
     return function(self, ...)
-        -- if dot-call: first argument is a string or nil, not a Path object
         if getmetatable(self) ~= Path then
-            -- treat self as the first real argument, and nil as self
             return fn(assertself(self), ...)
         else
-            -- normal colon-call
             self = assertself(self)
             return fn(self, ...)
         end
     end
 end
+
+---@param p string
+---@return string
 local function trim_trailing_sep(p)
     log("local: trim_trailing_sep")
     return p:gsub("\\+$", "")
 end
 
+---@param p string
+---@return string
 local function normalize(p)
     log("local: normalize")
-    p = tostring(p) -- convert to string.
-    p = p:gsub("/+$", "\\") -- Replace: Trailing forwardslashes
-    p = p:gsub("/+", "\\") -- Replace: forwardslashes along the string
-    p = p:gsub("^/+", "") --Remove: Leading forwardslashes
-    p = p:gsub("\\+", "\\") --Remove: duplicates of '\' 
-    p = p:gsub("\\+$", "") --Remove: Trailing backslashes
-    p = p:gsub("^\\+", "") --Remove: Leading backslashes
-    return p
-end
-
-
-local function tableToString(t, indent)
-    log("local: tableToString")
-    indent = indent or ""
-    local s = "{\n"
-    for k, v in pairs(t) do
-        local key = tostring(k)
-        local value
-        if type(v) == "table" then
-            value = tableToString(v, indent .. "  ")
-        else
-            value = tostring(v)
-        end
-        s = s .. indent .. "  " .. key .. " = " .. value .. "\n"
+    p = tostring(p)
+    local unc = p:match("^\\\\") and "\\" or ""
+    p = p:gsub("/", "\\")
+    p = p:gsub("\\+", "\\")
+    if not p:match("^%a:\\$") then
+        p = p:gsub("\\+$", "")
     end
-    s = s .. indent .. "}"
-    return s
+    if unc == "" then
+        p = p:gsub("^\\+", "")
+    end
+    return unc .. p
 end
 
+---@param t table
+---@param indent number?
+---@param noChildren boolean?
+---@return string
+function serializeTable(t, indent, noChildren)
+  indent = indent or 0
+  local sp = string.rep("  ", indent)
+  local s = "{\n"
+  local isArray = true
+
+  -- detect if table is array-like
+  local count = 0
+  for k,v in pairs(t) do
+    count = count + 1
+    if type(k) ~= "number" then isArray = false end
+  end
+
+  local idx = 1
+  for k,v in pairs(t) do
+    local key
+    if isArray then
+      key = ""  -- array keys not written
+    else
+      key = type(k) == "string" and '["'..k..'"]' or "["..k.."]"
+      key = key.." = "
+    end
+
+    local val
+    if type(v) == "table" then
+      if noChildren then
+        val = "{...}"  -- indicate child table exists but don't serialize
+      else
+        val = serializeTable(v, indent + 1)
+      end
+    elseif type(v) == "string" then
+      val = '"'..v..'"'
+    elseif type(v) == "boolean" then
+      val = v and "true" or "false"
+    elseif type(v) == "number" then
+      val = tostring(v)
+    else
+      val = 'nil'
+    end
+
+    s = s .. sp .. "  " .. key .. val .. ",\n"
+    idx = idx + 1
+  end
+
+  s = s .. sp .. "}"
+  return s
+end
+
+---@param t table
+---@return boolean
+function isNumArray(t)
+    return type(t) == "table" and t[1] ~= nil
+end
+
+---@param t table
+---@return integer
+function getItemsCount(t)
+    if type(t) ~= "table" then return 0 end
+    if isNumArray(t) then
+        return #t
+    else
+        local count = 0
+        for _ in pairs(t) do
+            count = count + 1
+        end
+        return count
+    end
+end
 
 
 --------------------------------------------------
 -- metamethods
---[`View online doc`](https://www.lua.org/manual/5.4/manual.html#2.4)
 --------------------------------------------------
 
+--- Convert Path to string
+---@return string
 function Path:__tostring()
     log(":__tostring")
     return self.path
 end
 
---the the addition (+) operation
+--- Addition operator (not standard, returns length + other)
+---@param other number
+---@return number
 function Path:__add(other)
     log(":__add")
-    return
+    return (#self.path) + other
 end
--- the subtraction (-) operation
+
+--- Subtraction operator (not standard, returns length - other)
+---@param other number
+---@return number
 function Path:__sub(other)
     log(":__sub")
-    return
+    return (#self.path) - other
 end
--- the multiplication (*) operation.
+
+--- Multiplication operator (not implemented)
+---@param other any
+---@return nil
 function Path:__mul(other)
     log(":__mul")
     return
 end
 
--- __concat: the concatenation (..) operation. 
+--- Path concatenation using `..` (__concat)
+--- Example:
+---   Path("C:\\Temp") .. "file.txt"
+---@param other string|Path
+---@return Path
 function Path:__concat(other)
-    log(":__concat")
-    --could be used as join?? like joining multiple path or path with string.
-    return
+    if type(other) == "string" then
+        other = normalize(other):gsub("^\\+", "")
+    elseif getmetatable(other) == Path then
+        other = trim_trailing_sep(other.path)
+    else
+        error("Cannot concatenate Path with " .. type(other))
+    end
+    return Path(trim_trailing_sep(self.path) .. "\\" .. other)
 end
 
--- the length (#) operation
-function Path:__len(other)
+--- Length operator (#) (__len)
+--- Returns character length of path string
+---@return integer
+function Path:__len()
     log(":__len")
     return #self.path
 end
 
---the equal (==) operation
---the equal (~=) operation
+--- Equality operator (==)
+--- compare the path, useful??
+---@param other Path
+---@return boolean
 function Path:__eq(other)
     log(":__eq")
-    return
+    return self.path == other.path
 end
---__lt: the less than (<) operation
+
+--- Less than operator (<)
+---@param other Path
+---@return boolean
 function Path:__lt(other)
     log(":__lt")
-    return
+    return self.path < other.path
 end
---__le: the less equal (<=) operation.
---__le: the less equal (>=) operation.
+
+--- Less or equal operator (<=)
+---@param other Path
+---@return boolean
 function Path:__le(other)
     log(":__le")
-    return
+    return self.path <= other.path
 end
 
-
---The call operation func(args)
+--- Callable Path
+--- () __call
+--- - No argument → returns raw path string
+--- - With argument → joins path
+---@param other string|nil
+---@return string|Path
 function Path:__call(other)
     log(":__call")
-    return self.path
-end
-
-
-
--- implement Path / "subfolder" syntax
-
--- Path(file_path):parent() / version / ".lua"
-
-Path.__div = function(self, other)
-    log(":__div")
-    -- if left-hand side is a string, convert to Path
-    if type(self) == "string" then
-        self = Path(self)
+    if other == nil then
+        return self.path
     end
-
-    -- if right-hand side is a string, normalize automatically
     return self:join(other)
 end
 
+--- Path division operator
+--- Enables: Path("C:\\") / "Temp" / "file.txt"
+--- Example: Path(file_path):parent() / version / ".lua"
+---@param other string|Path
+---@return Path
+Path.__div = function(self, other)
+    log(":__div")
+
+    self = assertself(self)
+    -- if type(self) == "string" then
+    --     self = Path(self)
+    -- end
+    return self:join(other)
+end
 
 --------------------------------------------------
 -- core operations
 --------------------------------------------------
 
--- Path(file_path):parent() / version / ".lua"
--- allows joining ".lua" not as a path but as a suffix
+--- Join another path segment
+--- Example: Path(file_path):parent() / version / ".lua"
+--- Special case: ".lua" is treated as a suffix, not a directory
+---@param other string
+---@return Path
 function Path:join(other)
     log(":join")
-
     local base = self.path
     local part = normalize(other or "")
-
-    -- If joining a suffix (".lua"), append to filename instead
     if part:match("^%.%w+$") then
         return self:with_suffix(part)
     end
-
     part = part:gsub("^\\+", "")
     return Path(base .. "\\" .. part)
 end
 
-
--- TODO: get full absolute path
+--- Resolve absolute path using Windows shell (best-effort, not canonical)
+---@return Path
 function Path:resolve()
     log(":resolve")
     local abs = self.path
@@ -230,101 +401,166 @@ function Path:resolve()
     end
     return Path(abs)
 end
+
 --------------------------------------------------
 -- filesystem queries
 --------------------------------------------------
 
+--- Check if path exists (file or directory)
+---@return boolean
 function Path:exists()
     log(":exists")
-    local f = io.open(self.path, "r") --read
-    if f then
-        f:close();
-        return true
-    end
-    return false
+    return self:is_file() or self:is_dir()
 end
 
---TODO: Add assert ?
+--- Check if path is a file
+---@return boolean
 function Path:is_file()
     log(":is_file")
-    local f = io.open(self.path, "rb") --readbyte
-    if f then
-        f:close();
-        return true
-    end
-    return false
-end
-
-function Path:is_dir()
-    log(":is_dir")
-
-    -- must exist
-    local f = io.open(self.path, "r")
+    local f = io.open(self.path, "rb")
     if f then
         f:close()
-        return false -- it's a file
-    end
-
-    -- directory check
-    local d = io.open(self.path .. "\\*", "r")
-    if d then
-        d:close()
         return true
     end
-
     return false
 end
 
-
---------------------------------------------------
--- read / write
---------------------------------------------------
-
-function Path:read_file()
-    log(":read_file")
-    local f = assert(io.open(self.path, "r"), "Cannot read file")
-    local data = f:read("*a")
-    f:close()
-    return data
-end
-
-function Path:write_file(text)
-    log(":write_file")
-    local f = assert(io.open(self.path, "w"), "Cannot write file")
-    f:write(text)
-    f:close()
-    return -- self.path
-end
-
--- Static helper: write text to a destination path
-function Path.write_file_dst(text, dst)
-    log(":write_file_dst")
-    assert(type(text) == "string", "text must be a string")
-
-    -- allow string or Path
-    if type(dst) == "string" then
-        dst = Path(dst)
+--- Check if path is a directory
+---@return boolean
+function Path:is_dir()
+    log(":is_dir")
+    if self._is_dir ~= nil then
+        return self._is_dir
     end
+    local p = self.path:gsub("\\+$", "")
+    local cmd = io.popen('if exist "' .. p .. '\\*" (echo 1) else (echo 0)')
+    local res = cmd:read("*l")
+    cmd:close()
+    self._is_dir = (res == "1")
+    return self._is_dir
+end
 
-    assert(getmetatable(dst) == Path, "dst must be a Path or string")
+--------------------------------------------------
+--  write operations
+--------------------------------------------------
 
-    -- ensure parent directory exists
-    local parent = dst:parent()
+-- Internal: Write text to file (overwrites)
+---@param self Path
+---@param text string
+---@return Path
+local function __write_file_impl(p, text)
+    log("local: __write_file_impl")
+    assert(type(text) == "string", "text must be a string")
+    p = assertself(p)
+    
+    local parent = p:parent()
     if parent and not parent:is_dir() then
         parent:mkdir(true)
     end
 
-    local f = assert(io.open(dst.path, "w"), "Cannot write file: " .. dst.path)
-    f:write(text)
-    f:close()
+    local f, err = io.open(p.path, "w")
 
-    return dst
+    if not f then
+        log_exceptions("Cannot open file for writing: " .. (err or p.path))
+        return nil
+    end
+    local success, handler_err = xpcall(function()
+        f:write(text)
+    end, log_exceptions)
+    f:close()
+    if not success then return nil end
+    return p
 end
+
+--- Write text to file (overwrites)
+--- Creates parent directories if needed
+---@param text string
+---@return Path self
+function Path:write_file(text)
+    log(":write_file")
+    return __write_file_impl(self, text)
+end
+
+--- Alias for write_file
+---@param text string
+---@return Path
+function Path:write_text(text)
+    log(":write_text")
+    return __write_file_impl(self, text)
+end
+
+--- Static helper: write text to path
+---@param p string|Path
+---@param text string
+---@return Path
+function Path.write_text(p, text)
+    log(".write_text")
+    return __write_file_impl(p, text)
+end
+
+--- Alias for write_text
+Path.write_file = Path.write_text
+
+--------------------------------------------------
+--  Read operations
+--------------------------------------------------
+
+-- Internal: Read file contents
+---@param self Path
+---@return string
+local function __read_file_impl(p)
+    log("local: read_file_impl")
+    p = assertself(p)
+
+    -- try to open the file safely
+    local f, err = io.open(p.path, "r")
+    if not f then
+        -- use your exception handler for consistency
+        log_exceptions("Cannot open file: " .. (err or p.path))
+        return nil
+    end
+
+    local data
+    -- read file safely
+    local success, handler_err = xpcall(function()
+        data = assert(f:read("*a"), "Failed to read file")
+    end, log_exceptions)
+
+    f:close()  -- always close file
+
+    if not success then
+        -- optionally re-throw or just return nil
+        return nil
+    end
+
+    return data
+end
+
+--- Read entire file contents
+---@return string
+function Path:read_file()
+    log(":read_file")
+    return __read_file_impl(self)
+end
+
+--- Static helper: read file contents
+---@param p string|Path
+---@return string
+function Path.read_file(p)
+    log(".read_file")
+    return __read_file_impl(p)
+end
+
+--- Alias for read_file
+Path.read_text = Path.read_file
 
 --------------------------------------------------
 -- directory operations
 --------------------------------------------------
--- TODO: support for different arch
+
+--- Create directory
+---@param parents boolean|nil  Create parent directories if true
+---@return Path self
 function Path:mkdir(parents)
     log(":mkdir")
     if parents then
@@ -335,12 +571,13 @@ function Path:mkdir(parents)
     return self
 end
 
+--- Iterate directory contents (non-recursive)
+---@return Path[]  Array of Path objects
 function Path:iterdir()
     log(":iterdir")
     assert(self:is_dir(), "Not a directory")
     local items = {}
     local p = self.path
-
     local cmd = io.popen('dir /b "' .. p .. '"')
     for line in cmd:lines() do
         items[#items + 1] = Path(p .. "\\" .. line)
@@ -352,12 +589,17 @@ end
 --------------------------------------------------
 -- pathlib-like properties
 --------------------------------------------------
+
+--- File name (nil if directory)
+---@return string|nil
 function Path:filename()
     log(":filename")
     if self:is_dir() then return nil end
     return self.path:match("([^\\]+)$")
 end
 
+--- File name without extension
+---@return string|nil
 function Path:filenamext()
     log(":filenemext")
     local name = self:filename()
@@ -365,47 +607,59 @@ function Path:filenamext()
         return name:gsub("(%..+)$", "")
     end
 end
+
+--- Full path string
+---@return string
 function Path:filepath()
     log(":filepath")
     return self.path
 end
 
+--- Parent directory
+---@return Path
 function Path:parent()
     log(":parent")
     return Path(self.path:match("^(.*)\\[^\\]+$") or self.path)
 end
 
-function Path:suffix() -- did not working
+--- File extension (including dot)
+---@return string|nil
+function Path:suffix()
     log(":suffix")
     return self.path:match("(%.%w+)$")
 end
 
+--- File name without suffix
+---@return string|nil
 function Path:stem()
     log(":stem")
     local n = self:filename()
     return n and n:gsub("%.%w+$", "")
 end
 
+--- Return a new Path with replaced suffix
+--- Handles both adding/replacing/removing extension
+---@param new_suffix string  Must start with "." or be empty to remove extension
+---@return Path
 function Path:with_suffix(new_suffix)
     log(":with_suffix")
-    assert(new_suffix:sub(1, 1) == ".", "Suffix must start with '.'")
-    return self:parent() / (self:stem() .. new_suffix)
-end
---- print(p2:replace_suffix([[.testa]]).path)
-function Path:replace_suffix(new_suffix)
-    log(":replace_suffix")
+
     assert(type(new_suffix) == "string", "suffix must be a string")
-    assert(new_suffix == "" or new_suffix:sub(1, 1) == ".",
+    assert(new_suffix == "" or new_suffix:sub(1,1) == ".",
            "suffix must start with '.' or be empty")
 
     local parent = self:parent()
     local stem = self:stem() or self:filename()
-
-    assert(stem, "cannot replace suffix on directory")
+    assert(stem, "cannot replace suffix on a directory")
 
     return parent / (stem .. new_suffix)
 end
+-- Alias: replace_suffix uses the same implementation
+Path.replace_suffix = Path.with_suffix 
 
+
+--- Return all path parts
+---@return string[]
 function Path:parts()
     log(":parts")
     local t = {}
@@ -415,70 +669,61 @@ function Path:parts()
     return t
 end
 
---------------------------------------------------
--- glob (basic)
---------------------------------------------------
-
+--- Glob files inside directory (Windows dir-based)
+--- Example: Path("C:\\Temp"):glob("*.lua")
+---@param pattern string
+---@return Path[]
 function Path:glob(pattern)
     log(":glob")
     assert(self:is_dir(), "Not a directory")
     local results = {}
     local p = trim_trailing_sep(self.path)
-
     local cmd = io.popen('dir /b "' .. p .. '\\' .. pattern .. '"')
     for line in cmd:lines() do
         results[#results + 1] = Path(p .. "\\" .. line)
     end
     cmd:close()
-
     return results
 end
 
 --------------------------------------------------
 -- debug info
 --------------------------------------------------
--- if i want to use p.info() i need to do like:
--- p = Path("whatever path")
--- print(p.info(p))
+
+--- Print detailed path info (for debugging)
+---@return table
 function Path:info()
     log(":info")
-
     local info =  {
         path = self.path or "",
         parent = tostring(self:parent()),
         exists = tostring(self:exists()),
-        is_file =tostring(self:is_file()),
+        is_file = tostring(self:is_file()),
         is_dir = tostring(self:is_dir()),
         filename = tostring(self:filename()),
         stem = tostring(self:stem()),
         suffix = tostring(self:suffix())
     }
-    print(tableToString(info))
-    return info
+    local s = serializeTable(info)
+    log(s)
+
+    return s
 end
 
-local function isNumArray(t)
-    return type(t) == "table" and t[1] ~= nil
-end
-local function getItemsCount(t)
-    if type(t) ~= "table" then return 0 end
-
-    -- array-style
-    if isNumArray(t) then
-        return #t
-    else
-        -- map-style
-        local count = 0
-        for _ in pairs(t) do
-            count = count + 1
-        end
-        return count
-    end
-end
 
 -- Converts a Lua script file into a flat string
 local eqcount = eqcount1
-local function convert_lua_to_flat_string_multiline(file_path,bool1)
+
+--- Export Lua file into a flattened loader script
+--- Converts source into a single loadable string and writes: <version>_exported.lua
+--- TODO content as input, eg no path as input
+--- todo content as output , eg no write of file er 
+---@param multiline boolean|nil  Preserve newlines if true
+---@param p Path
+---@param bool1 boolean|nil  Preserve newlines if true
+---@param text string? optional string to convert to exported?
+---@return string
+local function __convert_lua_to_flat_string_multiline(content,bool1)
 
     local function scan_comment(line, in_long_comment)
         local i = 1
@@ -613,11 +858,19 @@ local function convert_lua_to_flat_string_multiline(file_path,bool1)
     end
     
     --if type == nil then type = 0 end
+    -- WE are provided with a Path and not a string! handle it 
+    -- assert(getmetatable(p) == Path, "path must be Path or string")
 
-    local f = assert(io.open(file_path, "r"), "Cannot open file: " .. file_path)
-    local filename = file_path:match("^.+[\\/](.+)%.%w+$") or file_path:match("^(.+)%.%w+$") or file_path
-    local content = f:read("*a")
-    f:close()
+    -- -- local f, err = io.open(p.path, "r")
+    -- local content = p:read_file() 
+    -- --assert(f, err or "Cannot read file")
+    -- local file_path = p.path
+
+    -- --local filename = file_path:match("^.+[\\/](.+)%.%w+$") or file_path:match("^(.+)%.%w+$") or p.path
+    -- local filename = p:filename()
+    -- local content = assert(f:read("*a"), "Failed to read file")
+    -- f:close()
+    assert(type(content)=="string","[Path] Content is not string!")
 
     content = content:gsub("\r\n", "\n"):gsub("\r", "\n")
 
@@ -689,55 +942,177 @@ local function convert_lua_to_flat_string_multiline(file_path,bool1)
 
 
     -- join lines
-    local str1 = nil
-    if bool1 == true then
-        print("true")
-        str1 = table.concat(lines, "\n")
-    else
-        print("false")
-        str1 = table.concat(lines, " ")
+    if lines then
+        local str1 = nil
+        if bool1 == true then
+            log("bool1 = true")
+            str1 = table.concat(lines, "\n")
+        else
+            log("bool1 = false")
+            str1 = table.concat(lines, " ")
+        end
+        local version = str1:match('version%s*=%s*"([^"]+)"') or (Path(os.tmpname()):filenamext())
+
+        local libname = version:gsub("[%. %(%) ]", "_")
+
+        local eq = string.rep("=", eqcount)
+
+        local parts = {
+            "local ", libname,
+            "=[" .. eq .. "[", str1, "]" .. eq .. "]; load(", libname, ")();"
+
+        }
+
+        local str2 = table.concat(parts)
+    
+        -- local exportpath = Path(file_path):parent() / (libname .. "_exported") / ".lua"
+        -- log(libname)
+        -- log(exportpath:write_file(str2))
+        
+        return str2
     end
-    local version = str1:match('version%s*=%s*"([^"]+)"') or "sample1.0"
 
-    local libname = version:gsub("[%. %(%) ]", "_")
-
-    local eq = string.rep("=", eqcount)
-
-    local parts = {
-        "local ", libname,
-        "=[" .. eq .. "[", str1, "]" .. eq .. "]; load(", libname, ")();"
-
-    }
-
-
-    local str2 = table.concat(parts)
-
-    local exportpath = Path(file_path):parent() / (libname .. "_exported") / ".lua"
-    print(libname)
-    print(exportpath:write_file(str2))
-
-    return str2
+    return log_exceptions("__convert_lua_to_flat_string_multiline: No lines parsed")
 end
 
-function Path:exportLua(other)
-    assert(self:is_file(),"path provided is not a file, check the path is correct")
-    convert_lua_to_flat_string_multiline(self(),other)
-    return 
+
+
+
+
+--- Internal export helper
+---@param p Path|string Source path
+---@param other any Optional conversion flag
+---@param arg string|table|Path|nil Content OR destination
+---@return Path
+local function __exportLua(p, other, arg)
+    -- normalize p
+    p = assertself(p)
+
+    local content
+    local savePath
+
+    ----------------------------------------------------------------
+    -- ARG DISPATCH
+    ----------------------------------------------------------------
+    if arg ~= nil then
+        local t = type(arg)
+
+        -- CASE 1: arg is destination path
+        if t == "string" or getmetatable(arg) == Path then
+            savePath = assertself(arg)
+            content = __convert_lua_to_flat_string_multiline(
+                p:read_file(), other
+            )
+
+        -- CASE 2: arg is content
+        elseif t == "table" then
+            content = __convert_lua_to_flat_string_multiline(
+                serializeTable(arg), other
+            )
+
+        elseif t == "string" then
+            content = __convert_lua_to_flat_string_multiline(arg, other)
+
+        else
+            return log_exceptions("Invalid 3rd argument to exportLua")
+        end
+
+    -- CASE 3: no arg → read from p, export next to it
+    else
+        content = __convert_lua_to_flat_string_multiline(
+            p:read_file(), other
+        )
+    end
+
+    ----------------------------------------------------------------
+    -- TEMP FILE (SAFE WRITE)
+    ----------------------------------------------------------------
+    local tmp = Path(os.tmpname())
+    tmp:write_file(content)
+
+    ----------------------------------------------------------------
+    -- FINAL DESTINATION
+    ----------------------------------------------------------------
+
+
+    local exportPath
+
+    if savePath then
+        exportPath = savePath
+    else
+        exportPath = p:parent() / (p:stem() .. "_exported.lua")
+    end
+
+    exportPath:write_file(tmp:read_file())
+    os.remove(tmp.path)
+
+    log("Exported Lua to:", exportPath.path)
+    return exportPath
 end
 
 --------------------------------------------------
--- constructor
+-- Export this Path (file) as a flattened Lua loader script
 --------------------------------------------------
---- when creating the Path populate data such path, parent, filename, is_file etc??
-function Path.new(p)
-    log(".new")
-    assert(type(p) == "string", "Path must be a string")
-    return setmetatable({ path = normalize(p) }, Path)
+
+--- Instance method: export this Path (file)
+---@param other boolean|nil Preserve newlines if true
+---@param text string|table|nil Optional content to export instead of reading from file
+---@return string exported file path
+function Path:exportLua(other, text)
+    log(":exportLua")
+
+    -- if no text provided, we expect self to be a file
+    if text == nil then
+        assert(self:is_file(), "Path provided is not a file")
+        assert(self:exists(), "File does not exist: " .. self.path)
+    end
+
+    -- call the internal helper
+
+    local exported_path = __exportLua(self, other, text)
+    return exported_path
+end
+
+--------------------------------------------------
+-- Static method: exportLua with Path or string input
+--------------------------------------------------
+
+--- Static function: export a Path or string to flattened Lua
+---@param p Path|string Path to read from or save to
+---@param other boolean|nil Preserve newlines if true
+---@param text string|table|nil Optional content to export instead of reading from file
+---@return string exported file path
+function Path.exportLua(p, other, arg)
+    log("static: .exportLuaContent")
+
+    -- call the internal helper
+    local exported_path = __exportLua(p, other, arg)
+    return exported_path
+end
+
+--- Create a new Path instance
+--- All arguments are joined and normalized using Windows separators.
+---@param ... string  One or more path segments
+---@return Path
+function Path.new(...)
+    
+    local args = {...}
+    log("static .new, no args: '"..#args.."\'")
+    assert(#args > 0, "Path.new requires at least one argument")
+    local parts = {}
+    
+    for i, v in ipairs(args) do
+        assert(type(v) == "string", "All Path arguments must be strings")
+        parts[#parts + 1] = normalize(v)
+    end
+    local full_path = table.concat(parts, "\\")
+    return setmetatable({ path = full_path }, Path)
 end
 
 setmetatable(Path, {
-    __call = function(_, p)
-        return Path.new(p)
+
+    __call = function(_, ...)
+        return Path.new(...)
     end
 })
 
@@ -748,35 +1123,223 @@ Path.__index = Path
 local old_index = Path.__index
 
 function Path:__index(key)
-    log(":__index")
-    log("index called for: "..key)
-    return old_index[key]  -- fallback to normal methods
+    log(":__index, calling \'"..key.."\'")
+    return old_index[key]
 end
-
-
 
 -- Wrap all methods in Path table automatically
-for k, v in pairs(Path) do
-    
-    if type(v) == "function"
-        and k ~= "new"
-        and not k:match("^__") then
-        log("func: ",k)
-        Path[k] = wrap_method(v)
-    end
-end
+-- for k, v in pairs(Path) do
+--     if type(v) == "function"
+--         and k ~= "new"
+--         and not k:match("^__") then
+--         log("func: ",k)
+--         Path[k] = wrap_method(v)
+--     end
+-- end
 
 log("debug has been enabled.")
 print("[Pathlib] Loaded " .. Path.version)
+--- Test function for Path library
+--- Run this to validate all major Path operations
+function test_pathlib()
+
+    print("\n=== Pathlib Test Start ===")
+
+    local temp_dir = Path(os.getenv("TEMP") or "C:\\Temp") / "pathlib_test"
+    local pathlib_path = Path([[S:\02Development\01Source\lua\pathlib.lua]])
+
+    temp_dir:mkdir(true)
+    print("------------------------------------- Temp test directory:", temp_dir(), "-------------------------------------")
+
+    -- 1. Path construction
+    local p1 = Path("C:\\Temp") / "file.txt"
+    assert(getmetatable(p1) == Path, "p1 must be a Path")
+    assert(tostring(p1):match("C:\\Temp\\file.txt"), "Path construction failed")
+    print("------------------------------------- Constructor test passed:", p1(), "-------------------------------------")
+
+    -- 2. Parent / parts / stem / suffix
+    assert(p1:parent():filepath() == "C:\\Temp", "Parent path failed")
+    assert(p1:stem() == "file", "Stem failed")
+    assert(p1:suffix() == ".txt", "Suffix failed")
+    local parts = p1:parts()
+    assert(parts[#parts] == "file.txt", "Parts failed")
+    print("------------------------------------- Parent / parts / stem / suffix tests passed -------------------------------------")
+
+    -- 3. Suffix manipulation
+    local p2 = p1:with_suffix(".lua")
+    assert(p2:suffix() == ".lua", "with_suffix failed")
+    local p3 = p1:replace_suffix("")
+    assert(p3:suffix() == nil, "replace_suffix remove failed")
+    print("------------------------------------- Suffix manipulation tests passed -------------------------------------")
+
+    -- 4. Join / concatenation
+    local p4 = Path("C:\\Temp"):join("joined.lua")
+    assert(p4:suffix() == ".lua", "Join failed")
+    local p5 = Path("C:\\Temp") .. "concat.txt"
+    assert(p5:filename() == "concat.txt", "Concat operator failed")
+    assert(p5() == "C:\\Temp\\concat.txt", "Concat operator failed")
+    
+    print("------------------------------------- Join / concat tests passed -------------------------------------")
+
+    -- 5. File writing / reading
+    local test_text = p4:info()
+    local file_path = temp_dir / "test_export_file.txt"
+    file_path:write_file(test_text)
+    local read_text = file_path:read_file()
+    assert(read_text == test_text, "Write/read failed")
+    print("------------------------------------- Write / read test 1 passed -------------------------------------")
+
+    -- 5.1 File writing / reading for auto load script
+    local test_text2 = "sample_Load = "..test_text
+    local file_path2 = temp_dir / "test_export_file_for_load.txt"
+    file_path2:write_file(test_text2)
+    local read_text2 = file_path2:read_file()
+    assert(read_text2 == test_text2, "Write/read failed")
+    print("------------------------------------- Write / read test 2 passed -------------------------------------")
+
+
+    -- 6. Static write/read helpers
+    Path.write_text(temp_dir / "static.txt", "Static helper")
+    local static_content = Path.read_text(temp_dir / "static.txt")
+    assert(static_content == "Static helper", "Static helper failed")
+    print("------------------------------------- Static write/read tests passed -------------------------------------")
+
+    -- 7. mkdir / directory operations
+    local dir_path = temp_dir / "subdir"
+    dir_path:mkdir()
+    assert(dir_path:is_dir(), "mkdir failed")
+    local iter_items = temp_dir:iterdir()
+    assert(getItemsCount(iter_items) > 0, "iterdir failed")
+    print(" ------------------------------------- Directory tests passed ------------------------------------- ")
+
+    -- 8. Export normal Lua (instance)
+    local export_path = file_path:exportLua(true)
+    assert(export_path:exists(), "exportLua failed")
+    -- export loadable :
+
+    print(" ------------------------------------- exportLua test passed:", export_path(), " ------------------------------------- ")
+
+    ----------------------------------------------------------------
+    -- 8.1 Export Lua (static) to custom destination
+    ----------------------------------------------------------------
+    
+    local file_path2 = file_path:parent() / "test_export_static.lua"
+    local export_path2 = Path.exportLua(file_path, false, file_path2)
+    assert(tostring(file_path2) == tostring(export_path2), "exportLua2 path mismatch")
+    assert(export_path2:exists(), "exportLua2 failed")
+    print(" ------------------------------------- static exportLua test passed:", export_path2(), " ------------------------------------- ")
+
+
+
+    ----------------------------------------------------------------
+    -- 8.2 Export Lua from CONTENT (table input)
+    ----------------------------------------------------------------
+    local sample_export_content = {
+        HeadGroup = {
+            SubGroup1 = {
+                {
+                    text = "Cycle Num OR like",
+                    locations = {
+                        { x = 0, y = 0, z = 0, text = "display 1" },
+                        { x = 0, y = 0, z = 0, text = "display 2" },
+                    },
+                    ["any additional data"] = "",
+                },
+            },
+        },
+    }
+
+    local content_export_path = temp_dir / "test_export_content.lua"
+    local export_path3 = Path.exportLua(content_export_path, false, sample_export_content)
+
+    assert(export_path3:exists(), "exportLua content failed")
+
+    local exported_text = export_path3:read_file()
+    assert(type(exported_text) == "string" and #exported_text > 0,
+           "exported content empty")
+
+    print(" ------------------------------------- content exportLua test passed:", export_path3(), " ------------------------------------- ")
+
+
+    ----------------------------------------------------------------
+    -- 8.3 Export Lua from CONTENT (table input)
+    ----------------------------------------------------------------
+
+    -- create an isolated environment
+
+    -- sandbox environment
+    local sandbox = {
+        print = print,
+        Path  = Path,
+    }
+
+    setmetatable(sandbox, {
+        __index = function(_, k)
+            error("Access to global '" .. tostring(k) .. "' is denied", 2)
+        end
+    })
+
+    local lib_path1 = temp_dir / "test_export_pathlib1.lua"
+    local exported_path_lib1 = Path.exportLua(pathlib_path(),true,lib_path1)
+    assert(exported_path_lib1:exists(), "exportLua failed: "..exported_path_lib1())
+
+    -- load file with environment
+    local chunk, err = loadfile(exported_path_lib1.path, "bt", sandbox)
+    assert(chunk, "Error running exported pathlib1: " .. tostring(err))
+
+    -- local ok, err = pcall(loadfile(exported_path_lib1.path); print(Path.version))
+
+
+    print(" ------------------------------------- static exportLua test passed:", exported_path_lib1(), " ------------------------------------- ")
+
+    ----------------------------------------------------------------
+    -- 8.4 Export Lua from CONTENT (table input)
+    ----------------------------------------------------------------
+    -- sandbox environment
+    local sandbox = {
+        print = print,
+        Path  = Path,
+    }
+
+    setmetatable(sandbox, {
+        __index = function(_, k)
+            error("Access to global '" .. tostring(k) .. "' is denied", 2)
+        end
+    })
+
+    local lib_path2 = temp_dir / "test_export_pathlib2.lua"
+    local exported_path_lib2 = Path.exportLua(pathlib_path(),false,lib_path2)
+    assert(exported_path_lib2:exists(), "exportLua failed: "..exported_path_lib2())
+    --local ok, err = pcall(loadfile(exported_path_lib2.path))
+    --assert(ok, "Error running exported pathlib: " .. tostring(err))
+
+    local chunk, err = loadfile(exported_path_lib2.path, "bt", sandbox)
+    assert(chunk, "Error running exported pathlib2: " .. tostring(err))
+
+    print(" ------------------------------------- static exportLua test passed:", exported_path_lib2(), " ------------------------------------- ")
+
+
+    
+
+
+
+
+    -- 9. Error handling
+    local ok, err = pcall(function()
+        Path(123) -- invalid constructor
+    end)
+    assert(not ok and err:match("All Path arguments must be strings"), "Constructor error test failed")
+    print(" ------------------------------------- Error handling test passed ------------------------------------- ")
+
+    -- 10. Cleanup
+    for _, f in ipairs(temp_dir:iterdir()) do
+       os.remove(f.path)
+    end
+    os.execute('rmdir /s /q "' .. temp_dir.path .. '"')
+
+    print(" ------------------------------------- Cleanup done ------------------------------------- ")
+    print("=== Pathlib Test Completed Successfully ===\n")
+end
 
 
 return Path
-
---[[
-    to export this library load pathlib like it is then 
-    local p = Path([[G:\lua\pathlib.lua]])
-    p:exportLua()
-    done ! 
---]]
-
-
